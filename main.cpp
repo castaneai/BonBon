@@ -1,109 +1,119 @@
 #include "precompiled_header.h"
 
-HMODULE bonDriverDll = nullptr;
-HMODULE b25DecoderDll = nullptr;
-IBonDriver2* bonDriver = nullptr;
-IB25Decoder2* b25Decoder = nullptr;
-FILE* tsOutputStream = nullptr;
+std::thread* output_thread = nullptr;
+std::atomic_bool running = false;
 
-bool startup()
+void output_thread_func(std::ostream& output, const int& channel, const std::string& bon_dll_path, bool decode_enabled = true)
 {
-    bonDriverDll = LoadLibraryA("BonDriver_PT3-T.dll");
-    if (bonDriverDll == nullptr) {
-        fprintf(stderr, "LoadLibrary(BonDriver_PT3-T.dll) failed.\n");
-        return false;
+    #pragma region startup
+
+    auto bon_dll = LoadLibraryA(bon_dll_path.c_str());
+    if (bon_dll == nullptr) {
+        std::cerr << "LoadLibrary(" << bon_dll_path << ") failed." << std::endl;
+        return;
     }
-    bonDriver = dynamic_cast<IBonDriver2*>(((IBonDriver*(*)())GetProcAddress(bonDriverDll, "CreateBonDriver"))());
-    if (bonDriver == nullptr) {
-        fprintf(stderr, "CreateBonDriver() failed.\n");
-        return false;
+    auto bon = reinterpret_cast<IBonDriver2*(*)()>(GetProcAddress(bon_dll, "CreateBonDriver"))();
+    if (bon == nullptr) {
+        std::cerr << "CreateBonDriver() failed." << std::endl;
+        return;
     }
-    if (!bonDriver->OpenTuner()) {
-        fprintf(stderr, "OpenTuner() failed.\n");
-        return false;
+    if (!bon->OpenTuner()) {
+        std::cerr << "OpenTuner() failed." << std::endl;
+        return;
+    }
+    if (!bon->SetChannel(0, channel)) {
+        std::cerr << "SetChannel(" << channel << ") failed." << std::endl;
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto decoder_dll = LoadLibraryA("B25Decoder.dll");
+    if (decoder_dll == nullptr) {
+        std::cerr << "LoadLibrary(B25Decoder.dll) failed." << std::endl;
+        return;
+    }
+    auto decoder = reinterpret_cast<IB25Decoder2*(*)()>(GetProcAddress(decoder_dll, "CreateB25Decoder2"))();
+    if (!decoder->Initialize()) {
+        std::cerr << "B25Decoder->Initialize() failed." << std::endl;
+        return;
+    }
+    decoder->DiscardNullPacket(true);
+    decoder->DiscardScramblePacket(false);
+
+    #pragma endregion
+
+    bon->PurgeTsStream();
+    running = true;
+    while (running) {
+        BYTE* read_buffer = nullptr;
+        DWORD read_size = 0;
+        DWORD remain = 0;
+        if (bon->GetTsStream(&read_buffer, &read_size, &remain) && read_buffer != nullptr && read_size > 0) {
+            if (decode_enabled) {
+                BYTE* decoded_buffer = nullptr;
+                DWORD decoded_size = 0;
+                if (decoder->Decode(read_buffer, read_size, &decoded_buffer, &decoded_size) && decoded_buffer != nullptr && decoded_size > 0) {
+                    output.write(reinterpret_cast<const char*>(decoded_buffer), decoded_size);
+                }
+            }
+            else {
+                output.write(reinterpret_cast<const char*>(read_buffer), read_size);
+            }
+            if (remain == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
     }
 
-    b25DecoderDll = LoadLibraryA("B25Decoder.dll");
-    if (b25DecoderDll == nullptr) {
-        fprintf(stderr, "LoadLibrary(B25Decoder.dll) failed.\n");
-        return false;
+    #pragma region cleanup
+
+    BYTE* decoded_buffer = nullptr;
+    DWORD decoded_size = 0;
+    if (decoder->Flush(&decoded_buffer, &decoded_size) && decoded_buffer != nullptr && decoded_size > 0) {
+        output.write(reinterpret_cast<const char*>(decoded_buffer), decoded_size);
     }
-    b25Decoder = ((IB25Decoder2*(*)())GetProcAddress(b25DecoderDll, "CreateB25Decoder2"))();
-    if (!b25Decoder->Initialize()) {
-        fprintf(stderr, "B25Decoder initialize failed.\n");
-        return false;
-    }
-    b25Decoder->DiscardNullPacket(true);
-    b25Decoder->DiscardScramblePacket(false);
-    return true;
+    bon->PurgeTsStream();
+    bon->CloseTuner();
+    bon->Release();
+    FreeLibrary(bon_dll);
+    FreeLibrary(decoder_dll);
+
+    #pragma endregion
 }
 
-void cleanup()
+void handle_signal(int signal)
 {
-    if (tsOutputStream != nullptr) fclose(tsOutputStream);
-    if (b25Decoder != nullptr) b25Decoder->Release();
-    if (bonDriver != nullptr) {
-        bonDriver->CloseTuner();
-        bonDriver->Release();
-    }
-    if (bonDriverDll != nullptr) FreeLibrary(bonDriverDll);
-    if (b25DecoderDll != nullptr) FreeLibrary(b25DecoderDll);
-}
-
-void signalHandler(int signal)
-{
-    if (signal == SIGINT) {
-        cleanup();
+    if (signal == SIGINT || signal == SIGBREAK) {
+        running = false;
+        if (output_thread != nullptr) {
+            output_thread->join();
+            delete output_thread;
+        }
     }
     exit(signal);
 }
 
-void writeTS(FILE* const& fp)
-{
-    BYTE* tsData = nullptr;
-    DWORD gotDataSize = 0;
-    DWORD remainDataSize = 0;
-    if (bonDriver->GetTsStream(&tsData, &gotDataSize, &remainDataSize) &&
-        gotDataSize > 0) {
-        BYTE* decodedTsData = nullptr;
-        DWORD decodedDataSize = 0;
-        if (b25Decoder->Decode(tsData, gotDataSize, &decodedTsData, &decodedDataSize) &&
-            decodedDataSize > 0) {
-            fwrite(decodedTsData, decodedDataSize, 1, fp);
-        }
-        if (remainDataSize == 0) {
-            Sleep(100);
-        }
-    }
-}
-
 int main(int argc, char** argv)
 {
-    signal(SIGINT, signalHandler);
-
-    if (!startup()) {
-        fprintf(stderr, "startup() failed.\n");
-        return -1;
+    signal(SIGINT, handle_signal);
+    signal(SIGBREAK, handle_signal);
+    if (argc < 2) {
+        std::cout << "Usage: BonBon <channel_number> [<bon_dll_path>]" << std::endl;
+        return 0;
     }
+
+    #ifdef _WIN32
+    _setmode(_fileno(stdout), _O_BINARY);
+    #endif
 
     const auto channel = (argc == 2) ? atoi(argv[1]) : 3;
-    tsOutputStream = (argc == 3) ? fopen(argv[2], "wb") : stdout;
-    if (tsOutputStream == nullptr) {
-        fprintf(stderr, "fopen(%s) failed.\n", (argc == 3) ? argv[2] : "stdout");
-    }
-    if (tsOutputStream == stdout) {
-        _setmode(_fileno(stdout), _O_BINARY);
-    }
+    const auto bon_dll_path = std::string((argc > 2) ? argv[2] : "BonDriver_PT3-T.dll");
 
-    if (!bonDriver->SetChannel(0, channel)) {
-        fprintf(stderr, "SetChannel(0, %d) failed.\n", channel);
-        return -1;
-    }
-    Sleep(1000);
-
-    bonDriver->PurgeTsStream();
+    output_thread = new std::thread([channel, bon_dll_path]() {
+        output_thread_func(std::cout, channel, bon_dll_path);
+    });
     while (true) {
-        writeTS(tsOutputStream);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return 0;
 }
