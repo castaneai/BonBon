@@ -16,8 +16,8 @@ WindowsにおけるBonDriver_PT3-STを利用した録画テストプログラム
 -----------
 
 ```
-BonBon <channel> <output_file>
+BonBon <channel> [<bon_dll_path>]
 ```
 
-地上波のチャンネル `<channel>` を `<output_file>` に出力します．
-`<output_file>`が指定されていない場合は標準出力(`stdout`)が使用されます．
+地上波のチャンネル `<channel>` を 標準出力に出力します．
+`<bon_dll_path>` はBonDriverのDLLファイルのパスを指定します．省略した場合は`BonDriver_PT3-T.dll`となります．
